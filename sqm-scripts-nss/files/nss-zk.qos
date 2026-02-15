@@ -1,0 +1,382 @@
+#!/bin/sh
+# shellcheck disable=2086,3010,1091,3043,2034
+###############################################################################
+# nss-zk.qos -- HW-accelerated SQM for Qualcomm NSS (IPQ807x)
+# version 20260215
+#
+# Flat qdisc hierarchy: nsstbl (shaper) -> nssfq_codel (AQM), per direction.
+# All packet scheduling is offloaded to the NSS co-processor (accel_mode 0).
+#
+# Requirements:
+#   - Platform:  IPQ807x (Qualcomm IPQ8074)
+#   - Packages:  iproute2, tc (or tc-tiny), sqm-scripts
+#   - Kmods:     kmod-qca-nss-drv-qdisc, kmod-qca-nss-drv-igs
+#
+# Repository: https://github.com/JuliusBairaktaris/sqm-scripts-nss
+# Maintainer: Julius Bairaktaris <julius@bairaktaris.de>
+#
+# Credits:
+#   @qosmio (https://github.com/qosmio/sqm-scripts-nss)
+#   @michaelchen644 (https://forum.openwrt.org/u/michaelchen644)
+#   @rickkdotnet (https://github.com/rickkdotnet/sqm-scripts-nss)
+#
+
+. /lib/functions.sh
+. /lib/functions/network.sh
+. "${SQM_LIB_DIR}/defaults.sh"
+
+###############################################################################
+# Hotplug guard
+#
+# On kernel 5.15+, bringing up the IFB interface under high load can crash
+# the router when triggered by hotplug. If a qdisc is already installed on
+# the IFB device, skip re-initialization entirely.
+###############################################################################
+if [ -n "${ACTION}" ] && [ -n "${INTERFACE}" ] && [ -n "${DEVICE}" ]; then
+	DEV="ifb@${INTERFACE}"
+	sqm_debug "hotplug: ${ACTION} for ${INTERFACE} (${DEVICE})"
+	if $TC qdisc show dev $DEV >/dev/null 2>&1; then
+		sqm_log "hotplug: qdisc already present on $DEV, skipping"
+		exit 0
+	fi
+fi
+
+###############################################################################
+# Constants
+###############################################################################
+
+# Maximum queue depth in milliseconds. Used with speed and MTU to auto-calculate
+# the fq_codel packet limit when not set by the user.
+# 30ms limits initial bloat while giving CoDel ~494 packets at 200 Mbps/MTU 1518.
+MAXQLIMIT_MS=30
+
+# Floor for auto-calculated queue limit. CoDel needs enough packets to measure;
+# 200 is the minimum for reliable operation.
+MINLIMIT=200
+
+###############################################################################
+# Utility functions
+###############################################################################
+
+# Verify the WAN interface has an IP before proceeding.
+# Returns 1 (and logs an error) if the interface has no address yet.
+check_addr() {
+	local physdev iface_addr
+
+	network_get_physdev physdev "${IFACE}"
+	[ "$physdev" = "wan" ] || return 0
+
+	network_get_ipaddr iface_addr "${IFACE}"
+	if [ -z "$iface_addr" ]; then
+		sqm_error "check_addr: no IP on ${IFACE}, waiting for hotplug or manual restart"
+		return 1
+	fi
+	sqm_debug "check_addr: ${IFACE} has IP ${iface_addr}"
+}
+
+# Auto-detect L2 overhead from UCI network config.
+#
+# Base:    18 bytes  (14 ethernet header + 4 FCS)
+# NSS:    + 4 bytes  (internal framing, always present)
+# PPPoE:  +10 bytes  (8 PPPoE header + 2 PPP protocol ID)
+# VLAN:   + 4 bytes  (802.1Q tag, detected by dot in device name)
+#
+# Returns the overhead value on stdout.
+auto_detect_overhead() {
+	local proto device oh=22 # 18 ethernet + 4 NSS
+
+	proto=$(uci -q get "network.${IFACE}.proto")
+	device=$(uci -q get "network.${IFACE}.device")
+
+	[ "$proto" = "pppoe" ] && oh=$((oh + 10))
+
+	# VLAN device names contain a dot (e.g. wan.7)
+	case "$device" in
+	*.*) oh=$((oh + 4)) ;;
+	esac
+
+	sqm_log "auto_detect_overhead: proto=${proto:-static} device=${device:-$IFACE} -> ${oh} bytes"
+	echo $oh
+}
+
+# Calculate the fq_codel packet limit from bandwidth, MTU, and delay.
+# Formula: limit = (speed_kbps * 125) * (delay_ms / 1000) / mtu
+# Clamps to MINLIMIT to ensure CoDel has enough headroom.
+calc_limit() {
+	local speed=$1 mtu=$2 delay_ms=$3
+	local limit
+
+	limit=$(awk -v s="$speed" -v m="$mtu" -v d="$delay_ms" \
+		'BEGIN { print int((s * 125) * (d / 1000) / m) }')
+
+	if [ "$limit" -lt "$MINLIMIT" ]; then
+		sqm_debug "calc_limit: ${limit}p too low for CoDel, raising to ${MINLIMIT}p"
+		limit=$MINLIMIT
+	else
+		sqm_debug "calc_limit: ${limit}p (${speed} kbps, MTU ${mtu}, ${delay_ms}ms window)"
+	fi
+	echo $limit
+}
+
+# Resolve effective MTU (interface MTU + overhead) for a given direction.
+# Auto-detects overhead when OVERHEAD is 0 or unset.
+# Prints the effective MTU on stdout.
+calc_effective_mtu() {
+	local direction=$1
+	local mtu overhead
+
+	mtu=$(get_mtu $IFACE)
+	overhead="${OVERHEAD}"
+
+	if [ "${overhead}" -eq 0 ] 2>/dev/null || [ -z "${overhead}" ]; then
+		overhead=$(auto_detect_overhead)
+		sqm_log "${direction}: overhead not configured, auto-detected ${overhead} bytes"
+	fi
+
+	echo $((mtu + overhead))
+}
+
+###############################################################################
+# Qdisc setup
+###############################################################################
+
+# Add the root nsstbl (token bucket limiter) shaper.
+# Args: $1=interface  $2=speed_kbps  $3=burst_duration_us  $4=mtu
+add_nsstbl() {
+	local iface=$1 speed=$2 burst_us=$3 mtu=$4
+	local burst
+
+	sqm_debug "add_nsstbl: ${iface} rate=${speed}kbps burst=${burst_us}us mtu=${mtu}"
+
+	# Burst: tradeoff between CPU load and shaper strictness. The SQM default
+	# of 1000us is a good sweet spot for NSS -- minimal effect either way.
+	burst=$(get_burst ${mtu} ${speed} ${burst_us})
+	# Round to nearest MTU multiple for clean packet boundaries.
+	burst=$(awk -v b="$burst" -v m="$mtu" 'BEGIN { print int((b + m/2) / m) * m }')
+
+	$TC qdisc add dev $iface root handle 1: \
+		nsstbl rate "${speed}kbit" burst "$burst" mtu "$mtu" accel_mode 0
+}
+
+# Add nssfq_codel as child of the root nsstbl.
+# Args: $1=interface  $2=speed_kbps  $3=target  $4=limit  $5=mtu  $6=qdisc_opts
+#
+# NOTE: NSS nssfq_codel firmware does NOT support ecn/noecn parameters.
+# Passing them causes "Illegal, ECN not supported" and startup failure.
+# ECN settings from the SQM config are intentionally not forwarded.
+add_nssfq_codel() {
+	local iface=$1 speed=$2 target=$3 limit=$4 mtu=$5 opts=$6
+	local quantum
+
+	sqm_debug "add_nssfq_codel: ${iface} speed=${speed} target=${target} limit=${limit} mtu=${mtu} opts=[${opts}]"
+
+	# --- interval ---
+	# Set the CoDel interval (worst-case RTT to your services). Default 100ms
+	# works for most connections. Override via "interval XXms" in advanced opts.
+	case "$opts" in
+	*interval*) ;;
+	*)
+		opts="interval 100ms ${opts}"
+		sqm_debug "add_nssfq_codel: no interval specified, defaulting to 100ms"
+		;;
+	esac
+
+	# --- quantum ---
+	# Bytes dequeued per round. At MTU, all packets have equal weight.
+	# Lower quantum gives small packets (games, VoIP) higher dequeue priority.
+	# At <100 Mbps, default to ~MTU/5 per bufferbloat.net best practices.
+	case "$opts" in
+	*quantum*) ;;
+	*)
+		quantum=$mtu
+		if [ "$speed" -lt 100000 ]; then
+			quantum=$(((mtu / 5) + 1))
+			sqm_debug "add_nssfq_codel: speed <100Mbps, quantum lowered to ${quantum}"
+		else
+			sqm_debug "add_nssfq_codel: quantum set to MTU (${quantum})"
+		fi
+		opts="$(get_quantum ${quantum}) ${opts}"
+		;;
+	esac
+
+	# --- flows ---
+	# Number of hash buckets for flow classification. 1024 is the nssfq_codel default.
+	case "$opts" in
+	*flows*) ;;
+	*) opts="flows 1024 ${opts}" ;;
+	esac
+
+	# shellcheck disable=2046
+	$TC qdisc add dev $iface parent 1: handle 10: nssfq_codel \
+		$(get_limit "$limit") $(get_target "$target" "$speed") \
+		${opts} set_default accel_mode 0
+}
+
+###############################################################################
+# Direction setup
+###############################################################################
+
+egress() {
+	local mtu
+
+	[ -z "$ETARGET" ] && ETARGET="5ms"
+
+	mtu=$(calc_effective_mtu "egress")
+	[ -z "$ELIMIT" ] && ELIMIT=$(calc_limit ${UPLINK} ${mtu} ${MAXQLIMIT_MS})
+
+	add_nsstbl ${IFACE} ${UPLINK} ${ESHAPER_BURST_DUR_US} ${mtu} || {
+		sqm_error "egress: failed to add nsstbl shaper"
+		return 1
+	}
+
+	# shellcheck disable=2153
+	add_nssfq_codel ${IFACE} ${UPLINK} ${ETARGET} ${ELIMIT} ${mtu} "${EQDISC_OPTS}" || {
+		sqm_error "egress: failed to add nssfq_codel"
+		return 1
+	}
+}
+
+ingress() {
+	local mtu
+
+	[ -z "$ITARGET" ] && ITARGET="5ms"
+
+	mtu=$(calc_effective_mtu "ingress")
+	[ -z "$ILIMIT" ] && ILIMIT=$(calc_limit ${DOWNLINK} ${mtu} ${MAXQLIMIT_MS})
+
+	# Create IFB device for ingress shaping and redirect all inbound traffic to it.
+	# Reuse existing IFB to avoid kernel crashes on link up under high load.
+	if ! [ -e /sys/devices/virtual/net/$DEV ]; then
+		$IP link add name $DEV type ifb
+		sqm_log "ingress: created $DEV"
+	fi
+	$IP link set dev $DEV up
+
+	# Remove stale ingress qdisc if present (deleting qdisc removes all filters).
+	SILENT=1 $TC qdisc del dev $IFACE ingress 2>/dev/null
+
+	$TC qdisc add dev $IFACE handle ffff: ingress || {
+		sqm_error "ingress: failed to add ingress qdisc"
+		return 1
+	}
+
+	$TC filter add dev $IFACE parent ffff: protocol all \
+		u32 match u32 0 0 action nssmirred redirect dev $DEV fromdev $IFACE || {
+		sqm_error "ingress: failed to add redirect filter"
+		return 1
+	}
+
+	add_nsstbl ${DEV} ${DOWNLINK} ${ISHAPER_BURST_DUR_US} ${mtu} || {
+		sqm_error "ingress: failed to add nsstbl shaper"
+		return 1
+	}
+
+	# shellcheck disable=2153
+	add_nssfq_codel ${DEV} ${DOWNLINK} ${ITARGET} ${ILIMIT} ${mtu} "${IQDISC_OPTS}" || {
+		sqm_error "ingress: failed to add nssfq_codel"
+		return 1
+	}
+}
+
+###############################################################################
+# SQM lifecycle
+###############################################################################
+
+sqm_prepare_script() {
+	local module
+
+	if [ ! -d /sys/module/ifb ]; then
+		insmod ifb numifbs=0 2>>"${OUTPUT_TARGET}" || {
+			sqm_error "sqm_prepare_script: failed to load ifb module"
+			return 1
+		}
+	fi
+
+	for module in qca_nss_qdisc act_nssmirred; do
+		if [ ! -d /sys/module/$module ]; then
+			sqm_log "sqm_prepare_script: loading $module"
+			modprobe -v $module 2>>"${OUTPUT_TARGET}" || {
+				sqm_error "sqm_prepare_script: failed to load $module"
+				return 1
+			}
+		fi
+	done
+}
+
+sqm_start() {
+	local protocol
+
+	[ -n "$IFACE" ] || return 1
+
+	network_get_protocol protocol "$IFACE"
+
+	if [ "$protocol" = "wireguard" ]; then
+		sqm_error "sqm_start: Wireguard (${IFACE}) is not supported by NSS"
+		return 1
+	fi
+
+	DEV="ifb@${IFACE}"
+
+	ipt_log_restart
+	check_addr || return $?
+	sqm_prepare_script || return $?
+
+	if [ "${UPLINK}" -ne 0 ]; then
+		CUR_DIRECTION="egress"
+		if fn_exists egress && egress; then
+			sqm_log "sqm_start: egress shaping activated"
+		else
+			sqm_warn "sqm_start: egress setup failed"
+		fi
+	else
+		SILENT=1 $TC qdisc del dev ${IFACE} root 2>/dev/null
+		sqm_log "sqm_start: egress shaping disabled (UPLINK=0)"
+	fi
+
+	if [ "${DOWNLINK}" -ne 0 ]; then
+		CUR_DIRECTION="ingress"
+		if fn_exists ingress && ingress; then
+			sqm_log "sqm_start: ingress shaping activated"
+		else
+			sqm_warn "sqm_start: ingress setup failed"
+		fi
+	else
+		SILENT=1 $TC qdisc del dev ${DEV} root 2>/dev/null
+		sqm_log "sqm_start: ingress shaping disabled (DOWNLINK=0)"
+	fi
+
+	return 0
+}
+
+sqm_stop() {
+	local module
+
+	[ -n "$IFACE" ] || return 1
+
+	DEV="ifb@${IFACE}"
+	sqm_log "sqm_stop: tearing down SQM on ${IFACE} (${DEV})"
+
+	# Flat hierarchy: deleting root removes nsstbl + nssfq_codel in one call.
+	SILENT=1 $TC qdisc del dev $IFACE root 2>/dev/null
+
+	# Remove ingress qdisc (and all associated filters).
+	SILENT=1 $TC qdisc del dev $IFACE ingress 2>/dev/null
+
+	# Tear down the IFB device qdisc but keep the device itself.
+	# Deleting and recreating IFB under traffic can cause kernel panics on some kernels.
+	if [ -e /sys/devices/virtual/net/$DEV ]; then
+		$TC qdisc del dev $DEV root 2>/dev/null
+		sqm_log "sqm_stop: removed $DEV qdisc (device kept for reuse)"
+	fi
+
+	# Undo any iptables rules logged during setup.
+	ipt_log_rewind
+
+	# Keep kernel modules loaded to avoid crashes on reload.
+	# NSS modules are safe to leave resident and avoid potential race conditions.
+	sqm_debug "sqm_stop: keeping NSS modules loaded (safer for restart)"
+
+	return 0
+}
+
+# vim: ft=sh ts=2 sw=2 sts=2 et

@@ -1,97 +1,278 @@
-# sqm-scripts-nss
-Smart Queue Management Scripts for OpenWRT for use with NSS optimized builds.
+# sqm-scripts-nss: Hardware-Accelerated SQM for Qualcomm NSS (IPQ807x)
 
-NSS FQ-Codel proves very effective at maintaining low latency under load, while causing minimal CPU load on the router. 
+> Eliminate bufferbloat on OpenWrt with **zero CPU overhead** using Qualcomm NSS hardware offload. Achieve A+ bufferbloat grades at 300+ Mbps while your router's CPU stays idle.
 
-Currently only supports nssfq-codel and no traffic classification / marking due to limitations of the current driver. 
+This is a fork of [qosmio/sqm-scripts-nss](https://github.com/qosmio/sqm-scripts-nss) with a flattened qdisc hierarchy, automatic overhead detection, tighter queue limits, and dead code removal. Tested on IPQ807x (Qualcomm IPQ8074) with kernel 6.12, PPPoE, VLAN 7, and 300 Mbps FTTH.
+
+**Maintainer:** Julius Bairaktaris — [julius@bairaktaris.de](mailto:julius@bairaktaris.de)
+
+## Why NSS SQM?
+
+Standard SQM (fq_codel, CAKE) runs on the router's CPU. On a Qualcomm IPQ807x, the **NSS (Network Subsystem)** co-processor handles packet scheduling in dedicated hardware, freeing the CPU entirely. This means:
+
+- **No CPU load** from traffic shaping, even at gigabit speeds
+- **Consistent latency** regardless of what else the router is doing (WiFi, NAT, firewall)
+- **A+ bufferbloat grades** on [Waveform](https://www.waveform.com/tools/bufferbloat) with zero added latency under download load
+
+The tradeoff: NSS only supports `nssfq_codel` (no CAKE, no HFSC, no multi-class traffic classification). But for most users, a well-tuned fq_codel with hardware offload outperforms a feature-rich software qdisc that competes with the CPU for resources.
+
+## What This Fork Changes
+
+The upstream script creates a deep 7-qdisc hierarchy per direction with priority bands that **never receive any traffic** (verified with real packet counters). This fork strips it down to the minimum effective configuration: 2 qdiscs per direction, auto-detected overhead, and tighter queue limits.
+
+See [Fork Changes](#fork-changes-v20260215) for the full technical breakdown with before/after measurements.
 
 ## Requirements
 
-* An SQM enabled OpenWRT build such as https://github.com/ACwifidude/openwrt
-* sqm-scripts package
-* luci-app-sqm package (for configuration from the GUI)
+- OpenWrt with NSS support (IPQ807x / IPQ8074 platform)
+- `sqm-scripts` package
+- `kmod-qca-nss-drv-qdisc` and `kmod-qca-nss-drv-igs` kernel modules
+- `luci-app-sqm` (optional, for GUI configuration)
 
 ## Installation
 
-### Manual Installation
+### Quick Install (scp)
 
-* Just copy the nss-rk.qos and nss-rk.qos.help files to /usr/lib/sqm on your router
+Copy the script directly to your router:
 
-### Package Installation
+```bash
+scp nss-zk.qos root@192.168.1.1:/usr/lib/sqm/nss-zk.qos
+```
 
-* Download the .ipk package file from the [releases page](https://github.com/rickkdotnet/sqm-scripts-nss/releases/tag/ipk)
-* Go to the System -> Software menu on your router and upload the .ipk package file
+### OpenWrt Build System
 
-### Installation via feeds
+Add to your feeds and build:
 
-If you're building OpenWRT yourself, you can add this script to your build with a feed: 
+```bash
+echo "src-git sqm_scripts_nss https://github.com/JuliusBairaktaris/sqm-scripts-nss.git" >> feeds.conf
+./scripts/feeds update && ./scripts/feeds install sqm-scripts-nss
+```
 
-    echo "src-git sqm_scripts_nss https://github.com/rickkdotnet/sqm-scripts-nss.git" >> feeds.conf
-    ./scripts/feeds update
-    ./scripts/feeds install sqm-scripts-nss
- 
- Now you can find the script in menuconfig under 'Extra packages'.
+Then select `sqm-scripts-nss` in menuconfig under Network.
 
-## Configuration 
+## Configuration
 
-* Go to Network -> SQM QoS in luci
-* Add a a queue or change your existing one
-* Select your physical uplink interface (usually eth0)  
-* Sheck the 'enable this SQM instance' checkbox
-* Enter your down and upload speeds, 95% of your actual line speed is a good ballpark figure
-* Go to the queue discipline tab and select "fq_codel" as discipline and and "nss-rk.qos" for the script
-* Configure other parameters if you want, although the defaults should work well. If you like to play with the codel interval, you can do by entering 'interval XXms' in the 'advanced option string'. 
-* Click "save and apply" 
+1. Go to **Network -> SQM QoS** in LuCI
+2. Set your **WAN interface** (e.g. `wan`)
+3. Set **download/upload speeds** to ~95% of your actual line speed
+4. Under **Queue Discipline**, select `fq_codel` and `nss-zk.qos`
+5. Click **Save & Apply**
 
-If all went well you should now be able to enjoy lower latency under load, with minimal CPU load on the router. 
+That's it for basic setup. The script auto-detects your overhead based on your connection type.
 
-If it's working the output from tc should look something like this: 
+### Verifying It Works
 
-    root@nighthawk:~# tc -s qdisc show dev eth0
-    qdisc nsstbl 1: root refcnt 2 buffer/maxburst 4500b rate 36Mbit mtu 1514b accel_mode 0
-     Sent 2692502 bytes 7109 pkt (dropped 0, overlimits 190 requeues 0)
-     backlog 0b 0p requeues 0
-    qdisc nssfq_codel 10: parent 1: target 5ms limit 1001p interval 50ms flows 1024 quantum 300 set_default accel_mode 0
-     Sent 2692502 bytes 7109 pkt (dropped 0, overlimits 0 requeues 0)
-     backlog 0b 0p requeues 0
-     maxpacket 1518 drop_overlimit 0 new_flow_count 4024 ecn_mark 0
-     new_flows_len 0 old_flows_len 5
+```bash
+tc -s qdisc show dev wan
+tc -s qdisc show dev ifb@wan
+```
 
-    root@nighthawk:~# tc -s qdisc show dev nssifb
-    qdisc nsstbl 1: root refcnt 2 buffer/maxburst 45000b rate 360Mbit mtu 1514b accel_mode 0
-     Sent 2182202 bytes 8391 pkt (dropped 0, overlimits 0 requeues 0)
-     backlog 0b 0p requeues 0
-    qdisc nssfq_codel 10: parent 1: target 5ms limit 1001p interval 50ms flows 1024 quantum 1514 set_default accel_mode 0
-     Sent 2182202 bytes 8391 pkt (dropped 0, overlimits 0 requeues 0)
-     backlog 0b 0p requeues 0
-     maxpacket 1518 drop_overlimit 0 new_flow_count 5081 ecn_mark 0
-     new_flows_len 0 old_flows_len 1
+You should see exactly **2 qdiscs per direction** (nsstbl + nssfq_codel), both with `accel_mode 0` (NSS offload active):
 
-## Configuration notes
+```
+qdisc nsstbl 1: root refcnt 5 rate 145Mbit mtu 1536b accel_mode 0
+ Sent 4316052 bytes 6563 pkt (dropped 0, overlimits 182 requeues 0)
+qdisc nssfq_codel 10: parent 1: target 4ms limit 354p interval 50ms
+ flows 1024 quantum 304 set_default accel_mode 0
+ Sent 4316052 bytes 6563 pkt (dropped 0, overlimits 0 requeues 0)
+ maxpacket 1518 drop_overlimit 0 new_flow_count 2258 ecn_mark 0
+```
 
-* DO try lowering the codel interval to the worst-case latency of the internet services you frequently use. This make codel more aggressive/quicker to react. I use "interval 50ms" in the advanced options string
-* DO try lowering the codel target a little if you're on a low latency connection, it could shave off another ms or so.  
-* DO try adding "quantum 304" to the advanced options string for the lowest latency for games, voip etc. This essentially gives <304 bytes packets a 5x higher priority than 1518 packets to get dequeued.
-* DON'T set the queue size so small that you have taildropping (drop_overlimit counter in tc -s increasing), as this causes significant bufferbloat in the first few seconds of a speedtest (try pinging with a short interval while starting your test). Popular opinion is that 1000 packets should be enough for gigabit, but I needed more than 2000 packets on my 350 Mb/s nssifb interface. This might be a quirk of NSS/nssifb. 
-* DO your own testing and draw up your own conclusions. First there's a lot of hear-say on the internet, and second your situation might very well be different. 
+If you see `nssprio`, `nsspfifo`, or `nssred` in the output, the old upstream script is still loaded.
 
-FYI, as of March 2023, my tc config looks like this: 
+### Overhead (Auto-Detected)
 
-	qdisc nsstbl 1: dev eth0 root refcnt 2 buffer/maxburst 4554b rate 37Mbit mtu 1518b accel_mode 0
-	qdisc nssfq_codel 10: dev eth0 parent 1: target 3.5ms limit 304p interval 50ms   flows 1024 quantum 304 set_default accel_mode 0```
-	qdisc nsstbl 1: dev nssifb root refcnt 2 buffer/maxburst 45540b rate 360Mbit mtu 1518b accel_mode 0
-	qdisc nssfq_codel 10: dev nssifb parent 1: target 3.5ms limit 2964p interval 50ms flows 1024 quantum 304 set_default accel_mode 0
+When `OVERHEAD` is not set in the SQM config, the script **automatically detects** the correct value by reading your network interface configuration:
 
-## Known bugs, limitations
+| Component | Bytes | How detected |
+|---|---|---|
+| Ethernet (header + FCS) | 18 | Always present |
+| NSS internal framing | 4 | Always present |
+| PPPoE (header + PPP) | +10 | `network.<iface>.proto = pppoe` |
+| VLAN 802.1Q tag | +4 | `network.<iface>.device` contains `.` |
 
-* Due to limitations of the driver:
-    * Only fq-codel is supported as a queue discipline
-    * No marking or traffic classification is currently possible, this also means that DSCP squashing does not work
-    * ECN marking is not supported
-* The script does not does anything with the Link Layer Adaptation fields. 
-* On kernel 5.10 the script does not remove the nssifb interface if it's stopped, because removing or even bringing down the interface frequently crashed my router. This could cause problems if you're switching to a script which set up regular ifb4ethX interfaces. You probably need to reboot if you want to switch to another SQM script. 
-* On kernel 5.15 the above problem has been resolved, but in some cases (I think under high load), the router crashes on ip link up of nssifb, *especially* when called from hotplug. Because of this, there's workaround in the script that prevents the script from executing when it's called from hotplug.  
+Auto-detected values per connection type:
 
+| Connection Type | Overhead |
+|---|---|
+| Ethernet (direct) | 22 |
+| PPPoE | 32 |
+| PPPoE + VLAN (e.g. Telekom DE) | 36 |
 
+Check what was detected:
 
+```bash
+logread | grep auto_detect_overhead
+# SQM: auto_detect_overhead: proto=pppoe device=wan.7 -> overhead=36 bytes
+```
 
+Setting any non-zero `OVERHEAD` value in LuCI overrides auto-detection.
+
+### Gaming-Optimized Tuning
+
+For low-latency gaming, set these under **Advanced Options** in LuCI:
+
+| Setting | Value | Why |
+|---|---|---|
+| Target (egress + ingress) | `4ms` | Aggressive CoDel — detects bloat faster |
+| Advanced option string | `interval 50ms quantum 304` | 50ms reaction time, 5x priority for small packets (<304 bytes like game/VoIP packets) |
+
+The script auto-calculates queue limits based on a 30ms window. Don't set manual limits unless you know what you're doing.
+
+### Example: Telekom Germany FTTH (300/150 Mbps)
+
+Deutsche Telekom uses PPPoE over VLAN 7. Minimal SQM config — overhead is auto-detected:
+
+```
+Interface:  wan
+Download:   285000 kbps  (300 * 0.95)
+Upload:     142500 kbps  (150 * 0.95)
+Script:     nss-zk.qos
+Qdisc:      fq_codel
+Overhead:   (leave empty — auto-detects 36)
+
+Advanced options:  interval 50ms quantum 304
+Target:            4ms
+```
+
+## Fork Changes (v20260215)
+
+### Before: Upstream v20240502
+
+The upstream script creates **7 qdiscs per direction** (14 total). Real packet counters from an IPQ807x router running 140/285 Mbps:
+
+```
+=== EGRESS (wan) — 7 qdiscs ===
+nsstbl 1: root           rate 140Mbit    219,785 pkt
+nssprio 10: parent 1:    bands 3         219,785 pkt
+nsstbl 100: parent 10:1  rate 14Mbit           0 pkt  (dead)
+nsspfifo 1000:                                 0 pkt  (dead)
+nsstbl 200: parent 10:2  rate 56Mbit           0 pkt  (dead)
+nssred 2000:                                   0 pkt  (dead)
+nssfq_codel 300: parent 10:3 set_default 220,011 pkt  (all traffic)
+
+=== INGRESS (ifb@wan) — 7 qdiscs ===
+nsstbl 1: root           rate 285Mbit    829,512 pkt
+nssprio 10: parent 1:    bands 3         829,512 pkt
+nsstbl 100: parent 10:1  rate 28.5Mbit         0 pkt  (dead)
+nsspfifo 1000:                                 0 pkt  (dead)
+nsstbl 200: parent 10:2  rate 114Mbit          0 pkt  (dead)
+nssred 2000:                                   0 pkt  (dead)
+nssfq_codel 300: parent 10:3 set_default 829,569 pkt  (all traffic)
+```
+
+10 out of 14 qdiscs process **zero packets**. The `nssprio` DSCP classification is ineffective because NSS ECM (Enhanced Connection Manager) accelerates flows after the first packet, bypassing Linux TC filters entirely.
+
+### After: Fork v20260215
+
+**2 qdiscs per direction** (4 total):
+
+```
+=== EGRESS (wan) — 2 qdiscs ===
+nsstbl 1: root              rate 145Mbit  mtu 1536b  accel_mode 0
+nssfq_codel 10: parent 1:   target 4ms  limit 354p  interval 50ms  quantum 304
+
+=== INGRESS (ifb@wan) — 2 qdiscs ===
+nsstbl 1: root              rate 295Mbit  mtu 1536b  accel_mode 0
+nssfq_codel 10: parent 1:   target 4ms  limit 720p  interval 50ms  quantum 304
+```
+
+### Bufferbloat Test Results (Waveform)
+
+Both upstream and fork achieve **A+** grades. Latency is identical — the fork just removes dead weight:
+
+| Metric | Upstream | Fork |
+|---|---|---|
+| **Bufferbloat grade** | A+ | A+ |
+| Unloaded latency | 11 ms | 11 ms |
+| Download +latency | +0 ms | +0 ms |
+| Upload +latency | +5 ms | +5 ms |
+| Download speed | 249 Mbps | 267 Mbps |
+| Upload speed | 121 Mbps | 125 Mbps |
+| Qdiscs (per direction) | 7 | 2 |
+| Queue limit | 3000p (manual) | 354-720p (auto) |
+
+### Technical Changes
+
+#### 1. Flattened qdisc hierarchy
+
+Removed the `nssprio` subtree (nssprio, 2x nsstbl, nsspfifo, nssred) — 5 dead qdiscs per direction. `nssfq_codel` is now a direct child of the root `nsstbl`.
+
+The old hierarchy existed for DSCP-based priority classification, but it never worked: `set_default` routed all traffic to band 2, and no TC filters were configured. Even if filters existed, NSS ECM accelerates flows after the first packet — only the initial SYN ever hits TC classification.
+
+#### 2. Tighter queue limits
+
+`MAXQLIMIT_MS` reduced from 100ms to 30ms. Queue depth is auto-calculated based on speed and MTU:
+
+- 300 Mbps → ~720 packets (30ms)
+- 150 Mbps → ~354 packets (30ms)
+- Below ~130 Mbps → 200 packets (MINLIMIT floor, sufficient for CoDel)
+
+The old 100ms default allowed initial bufferbloat before CoDel's detection kicked in.
+
+#### 3. Automatic overhead detection
+
+New `auto_detect_overhead()` function reads UCI network config to determine L2 framing overhead. Detects PPPoE (+10 bytes) and VLAN tagging (+4 bytes) automatically. Falls back to 22 bytes (Ethernet + NSS) for plain ethernet connections.
+
+The upstream script hardcoded 18 bytes when overhead wasn't configured — wrong for PPPoE (needs 32-36) and gave no indication that configuration was needed.
+
+#### 4. ECN handling
+
+NSS `nssfq_codel` firmware does not support `ecn`/`noecn` tc parameters (rejects with `Illegal, ECN not supported`). The script intentionally does not pass ECN settings to avoid startup failures. The `ecn_mark` counter in `tc -s` output exists but cannot be controlled via tc.
+
+#### 5. Code cleanup
+
+- Removed dead `get_ecn()` function (NSS rejects ECN params; never called)
+- Removed `cake_egress()` / `cake_ingress()` stubs (CAKE not supported by NSS)
+- Extracted `calc_effective_mtu()` to DRY up duplicated overhead+MTU logic in `egress()`/`ingress()`
+- Replaced bash-only `[[ ]]` tests with POSIX `case` patterns (shebang is `#!/bin/sh`)
+- Simplified `sqm_stop()` for flat hierarchy (single `tc qdisc del root` instead of nested teardown)
+- Added `ipt_log_rewind` in `sqm_stop()` for proper iptables rule cleanup
+- Fixed `exit $?` → `return $?` in `sqm_start()` (no longer kills the shell on `check_addr` failure)
+- Fixed inconsistent raw `tc` vs `$TC` wrapper usage in `sqm_stop()`
+- Proper `local` scoping for all function variables (`burst`, `quantum`, `mtu`, etc.)
+- Removed unused ECN parameter from `add_nsstbl()`
+- Fixed `local IFACE` vs `IF` variable name mismatch
+
+## FAQ
+
+### Does this work with CAKE?
+
+No. NSS hardware only supports `nssfq_codel`. CAKE, HFSC, and HTB are software-only qdiscs that run on the CPU. If you need CAKE features (per-host fairness, tin-based prioritization), use the standard `piece_of_cake.qos` script — but expect CPU usage.
+
+### What routers are supported?
+
+Any OpenWrt router with a **Qualcomm IPQ807x / IPQ8074** SoC and NSS-enabled firmware. Common models include the Dynalink DL-WRX36, Xiaomi AX9000, and Netgear WAX630. The NSS co-processor must be active with `kmod-qca-nss-drv-qdisc` loaded.
+
+### How is this different from qosmate?
+
+[qosmate](https://github.com/hudra0/qosmate) is a CPU-based QoS system using HFSC/HTB + nftables for DSCP classification. It offers multi-class traffic prioritization but cannot offload to NSS. This script trades classification features for **zero CPU overhead** via hardware offload — better for high-throughput links where CPU is the bottleneck.
+
+### Do I need to set overhead manually?
+
+No. The script auto-detects PPPoE (+10 bytes) and VLAN (+4 bytes) overhead from your UCI network config. You only need to set it manually if auto-detection gets it wrong (check with `logread | grep auto_detect_overhead`).
+
+### Why is my bufferbloat grade A instead of A+?
+
+A vs A+ is within Waveform's test-to-test variance (~1ms). Both grades indicate effectively zero added latency. If you see B or below, verify your shaper rates are set to ~95% of your actual line speed.
+
+## Known Limitations
+
+- **Only fq_codel** is supported as a queue discipline (NSS firmware limitation)
+- **No traffic classification** — DSCP marking, squashing, and multi-class prioritization are not possible with NSS qdiscs. All flows get equal treatment within fq_codel's fair queuing.
+- **ECN not supported** — NSS firmware rejects `ecn`/`noecn` parameters
+- **No `stab` (Link Layer Adaptation)** — NSS hardware qdiscs don't support tc's statistics-based overhead accounting. The auto-detected fixed overhead is sufficient for Ethernet/FTTH; DSL with ATM framing may see minor inaccuracy for small packets.
+- On kernel 5.15, the router may crash on `ip link up` of the IFB interface under high load, especially when triggered by hotplug. A workaround in the script prevents execution from hotplug events.
+
+## Credits
+
+- Maintainer: Julius Bairaktaris ([@JuliusBairaktaris](https://github.com/JuliusBairaktaris)) — [julius@bairaktaris.de](mailto:julius@bairaktaris.de)
+- Upstream: [@qosmio](https://github.com/qosmio/sqm-scripts-nss)
+- Original script: [@rickkdotnet](https://github.com/rickkdotnet/sqm-scripts-nss)
+- Derived from work by [@michaelchen644](https://forum.openwrt.org/u/michaelchen644)
+- NSS Packages: [qosmio/nss-packages](https://github.com/qosmio/nss-packages)
+
+---
+
+*If this script helped you eliminate bufferbloat, consider starring the repo — it helps others find it.*
+- NSS Packages: [qosmio/nss-packages](https://github.com/qosmio/nss-packages)
