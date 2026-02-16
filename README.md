@@ -89,6 +89,8 @@ When `OVERHEAD` is not set in the SQM config, the script **automatically detects
 | Ethernet (header + FCS) | 18 | Always present |
 | NSS internal framing | 4 | Always present |
 | PPPoE (header + PPP) | +10 | `network.<iface>.proto = pppoe` |
+| DS-Lite (IPv6 encap) | +40 | `network.<iface>.proto = dslite` |
+| MAP-E (IPv4-in-IPv6) | +20 | `network.<iface>.proto = map` |
 | VLAN 802.1Q tag | +4 | `network.<iface>.device` contains `.` |
 
 Auto-detected values per connection type:
@@ -98,6 +100,8 @@ Auto-detected values per connection type:
 | Ethernet (direct) | 22 |
 | PPPoE | 32 |
 | PPPoE + VLAN (e.g. Telekom DE) | 36 |
+| DS-Lite (IPv4-in-IPv6 tunnel) | 62 |
+| MAP-E (IPv4-in-IPv6 mapping) | 42 |
 
 Check what was detected:
 
@@ -216,13 +220,36 @@ New `auto_detect_overhead()` function reads UCI network config to determine L2 f
 
 The upstream script hardcoded 18 bytes when overhead wasn't configured — wrong for PPPoE (needs 32-36) and gave no indication that configuration was needed.
 
-#### 4. ECN handling
+#### 4. ECN passthrough (firmware limitation documented)
 
-NSS `nssfq_codel` firmware does not support `ecn`/`noecn` tc parameters (rejects with `Illegal, ECN not supported`). The script intentionally does not pass ECN settings to avoid startup failures. The `ecn_mark` counter in `tc -s` output exists but cannot be controlled via tc.
+ECN (Explicit Congestion Notification) allows CoDel to **mark** packets instead of **dropping** them during congestion. The sender sees the CE (Congestion Experienced) mark and slows down — same effect as a drop, but no retransmissions needed. This is especially useful for ingress shaping where drops trigger expensive TCP retransmits.
+
+**Source code analysis** — ECN appears fully wired from tc → kernel → firmware:
+
+| Layer | Source | ECN support |
+|---|---|---|
+| Firmware interface | [`nss_shaper.h`](https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-drv/-/blob/NHSS.QSDK.12.5.0.6/exports/nss_shaper.h) | `uint32_t ecn` field in `nss_shaper_config_codel_param` |
+| Kernel module | [`nss_codel.c`](https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-clients/-/blob/NHSS.QSDK.12.5.0.6/nss_qdisc/nss_codel.c) | `q->ecn = qopt->ecn` — wires tc parameter through to firmware |
+| tc userspace | `q_nss.c` (iproute2 patch) | `ecn`/`noecn` keywords parsed, `opt.ecn` set |
+| tc stats output | `q_nss.c` | `ecn_mark %u` counter printed in `tc -s` |
+
+**However, testing confirms the NSS firmware does NOT actually perform ECN marking:**
+
+| Test condition | Result |
+|---|---|
+| ECN negotiated end-to-end | Yes — `ss -teni` shows `ecn ecnseen` on all TCP flows |
+| iperf3 `-4 -R -P 4` sustained 265 Mbps, 15 sec | ~1200 CoDel drops (`drop_overlimit`) |
+| `ecn_mark` counter after test | **0** (never incremented) |
+| Firmware / kernel | NHSS.QSDK.12.5, kernel 6.12.68 |
+| Test date | February 2026 |
+
+The firmware accepts the `ecn` parameter and exposes the `ecn_mark` counter, but the CoDel implementation always drops rather than marks. The counter is dead code in the current firmware.
+
+The script still forwards SQM's ECN settings (`EECN`/`IECN` from `defaults.sh`) to `nssfq_codel` for forward-compatibility — if Qualcomm fixes the firmware, ECN marking will start working without script changes. If the tc binary rejects the parameter (stock iproute2 without the [ECN patch](https://github.com/qosmio/openwrt-ipq/pull/86)), the script retries without it and logs a warning.
 
 #### 5. Code cleanup
 
-- Removed dead `get_ecn()` function (NSS rejects ECN params; never called)
+- Added ECN passthrough with graceful fallback (forwards SQM ECN settings; retries without if tc rejects)
 - Removed `cake_egress()` / `cake_ingress()` stubs (CAKE not supported by NSS)
 - Extracted `calc_effective_mtu()` to DRY up duplicated overhead+MTU logic in `egress()`/`ingress()`
 - Replaced bash-only `[[ ]]` tests with POSIX `case` patterns (shebang is `#!/bin/sh`)
@@ -260,7 +287,8 @@ A vs A+ is within Waveform's test-to-test variance (~1ms). Both grades indicate 
 
 - **Only fq_codel** is supported as a queue discipline (NSS firmware limitation)
 - **No traffic classification** — DSCP marking, squashing, and multi-class prioritization are not possible with NSS qdiscs. All flows get equal treatment within fq_codel's fair queuing.
-- **ECN not supported** — NSS firmware rejects `ecn`/`noecn` parameters
+- **ECN marking does not work** — Despite full source-level support from tc → kernel module ([`nss_codel.c`](https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-clients/-/blob/NHSS.QSDK.12.5.0.6/nss_qdisc/nss_codel.c): `q->ecn = qopt->ecn`) → firmware interface ([`nss_shaper.h`](https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-drv/-/blob/NHSS.QSDK.12.5.0.6/exports/nss_shaper.h): `nss_shaper_config_codel_param.ecn`), the NSS firmware does not perform ECN marking. The `ecn_mark` counter in `tc -s` always reads 0 even with ECN-negotiated flows and active CoDel drops. See [ECN passthrough](#4-ecn-passthrough-firmware-limitation-documented) for full test methodology.
+- **peakrate (dual-rate shaping) untested** — The `nsstbl` kernel module ([`nss_tbl.c`](https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-clients/-/blob/NHSS.QSDK.12.5.0.6/nss_qdisc/nss_tbl.c)) supports CIR + PIR via `lap_cir`/`lap_pir`, and tc accepts the `peakrate` keyword with the [iproute2 patch](https://github.com/qosmio/openwrt-ipq/pull/86). However, `tc -s` does not display peakrate in output, making it unclear whether the firmware actually applies dual-rate shaping.
 - **No `stab` (Link Layer Adaptation)** — NSS hardware qdiscs don't support tc's statistics-based overhead accounting. The auto-detected fixed overhead is sufficient for Ethernet/FTTH; DSL with ATM framing may see minor inaccuracy for small packets.
 - On kernel 5.15, the router may crash on `ip link up` of the IFB interface under high load, especially when triggered by hotplug. A workaround in the script prevents execution from hotplug events.
 
@@ -275,4 +303,3 @@ A vs A+ is within Waveform's test-to-test variance (~1ms). Both grades indicate 
 ---
 
 *If this script helped you eliminate bufferbloat, consider starring the repo — it helps others find it.*
-- NSS Packages: [qosmio/nss-packages](https://github.com/qosmio/nss-packages)

@@ -2,7 +2,7 @@
 # shellcheck disable=2086,3010,1091,3043,2034
 ###############################################################################
 # nss-zk.qos -- HW-accelerated SQM for Qualcomm NSS (IPQ807x)
-# version 20260215
+# version 20260216
 #
 # Flat qdisc hierarchy: nsstbl (shaper) -> nssfq_codel (AQM), per direction.
 # All packet scheduling is offloaded to the NSS co-processor (accel_mode 0).
@@ -58,20 +58,25 @@ MINLIMIT=200
 # Utility functions
 ###############################################################################
 
-# Verify the WAN interface has an IP before proceeding.
-# Returns 1 (and logs an error) if the interface has no address yet.
+# Verify the interface has an IP before proceeding.
+# PPPoE/DS-Lite/MAP interfaces may not have an IP yet at boot time;
+# we detect them by protocol and wait for hotplug to re-trigger SQM.
+# Static/DHCP interfaces always have IPs by the time SQM runs.
 check_addr() {
-	local physdev iface_addr
+	local proto iface_addr
 
-	network_get_physdev physdev "${IFACE}"
-	[ "$physdev" = "wan" ] || return 0
+	proto=$(uci -q get "network.${IFACE}.proto")
+	case "$proto" in
+	pppoe|dslite|map) ;;
+	*) return 0 ;;
+	esac
 
 	network_get_ipaddr iface_addr "${IFACE}"
 	if [ -z "$iface_addr" ]; then
-		sqm_error "check_addr: no IP on ${IFACE}, waiting for hotplug or manual restart"
+		sqm_error "check_addr: no IP on ${IFACE} (proto=${proto}), waiting for hotplug or manual restart"
 		return 1
 	fi
-	sqm_debug "check_addr: ${IFACE} has IP ${iface_addr}"
+	sqm_debug "check_addr: ${IFACE} has IP ${iface_addr} (proto=${proto})"
 }
 
 # Auto-detect L2 overhead from UCI network config.
@@ -79,6 +84,8 @@ check_addr() {
 # Base:    18 bytes  (14 ethernet header + 4 FCS)
 # NSS:    + 4 bytes  (internal framing, always present)
 # PPPoE:  +10 bytes  (8 PPPoE header + 2 PPP protocol ID)
+# DS-Lite: +40 bytes (IPv6 header encapsulation)
+# MAP-E:  +20 bytes  (IPv4-in-IPv6 mapping)
 # VLAN:   + 4 bytes  (802.1Q tag, detected by dot in device name)
 #
 # Returns the overhead value on stdout.
@@ -88,7 +95,11 @@ auto_detect_overhead() {
 	proto=$(uci -q get "network.${IFACE}.proto")
 	device=$(uci -q get "network.${IFACE}.device")
 
-	[ "$proto" = "pppoe" ] && oh=$((oh + 10))
+	case "$proto" in
+	pppoe)  oh=$((oh + 10)) ;;
+	dslite) oh=$((oh + 40)) ;;
+	map)    oh=$((oh + 20)) ;;
+	esac
 
 	# VLAN device names contain a dot (e.g. wan.7)
 	case "$device" in
@@ -106,8 +117,7 @@ calc_limit() {
 	local speed=$1 mtu=$2 delay_ms=$3
 	local limit
 
-	limit=$(awk -v s="$speed" -v m="$mtu" -v d="$delay_ms" \
-		'BEGIN { print int((s * 125) * (d / 1000) / m) }')
+	limit=$(( speed * 125 * delay_ms / 1000 / mtu ))
 
 	if [ "$limit" -lt "$MINLIMIT" ]; then
 		sqm_debug "calc_limit: ${limit}p too low for CoDel, raising to ${MINLIMIT}p"
@@ -152,23 +162,36 @@ add_nsstbl() {
 	# of 1000us is a good sweet spot for NSS -- minimal effect either way.
 	burst=$(get_burst ${mtu} ${speed} ${burst_us})
 	# Round to nearest MTU multiple for clean packet boundaries.
-	burst=$(awk -v b="$burst" -v m="$mtu" 'BEGIN { print int((b + m/2) / m) * m }')
+	burst=$(( ((burst + mtu / 2) / mtu) * mtu ))
 
 	$TC qdisc add dev $iface root handle 1: \
 		nsstbl rate "${speed}kbit" burst "$burst" mtu "$mtu" accel_mode 0
 }
 
 # Add nssfq_codel as child of the root nsstbl.
-# Args: $1=interface  $2=speed_kbps  $3=target  $4=limit  $5=mtu  $6=qdisc_opts
+# Args: $1=interface  $2=speed_kbps  $3=target  $4=limit  $5=mtu  $6=qdisc_opts  $7=ecn
 #
-# NOTE: NSS nssfq_codel firmware does NOT support ecn/noecn parameters.
-# Passing them causes "Illegal, ECN not supported" and startup failure.
-# ECN settings from the SQM config are intentionally not forwarded.
+# ECN: The tc extension accepts ecn/noecn and the kernel module forwards the
+# flag to firmware (nss_codel.c: q->ecn = qopt->ecn), but testing confirms the
+# NSS firmware does NOT actually perform ECN marking — ecn_mark stays 0 even
+# with ECN-negotiated TCP flows and active CoDel drops. The firmware always
+# drops rather than marks. (Tested: NHSS.QSDK.12.5, kernel 6.12, Feb 2026.)
+#
+# We still forward the SQM ECN setting for forward-compatibility: if Qualcomm
+# fixes the firmware, ECN will start working without script changes.
+# If tc rejects the parameter (stock iproute2), we retry without it.
 add_nssfq_codel() {
-	local iface=$1 speed=$2 target=$3 limit=$4 mtu=$5 opts=$6
+	local iface=$1 speed=$2 target=$3 limit=$4 mtu=$5 opts=$6 ecn=$7
 	local quantum
 
-	sqm_debug "add_nssfq_codel: ${iface} speed=${speed} target=${target} limit=${limit} mtu=${mtu} opts=[${opts}]"
+	local ecn_opt=""
+
+	if [ -n "$ecn" ]; then
+		ecn_opt=$(get_ecn "$ecn")
+		sqm_debug "add_nssfq_codel: ECN requested: ${ecn} -> ${ecn_opt}"
+	fi
+
+	sqm_debug "add_nssfq_codel: ${iface} speed=${speed} target=${target} limit=${limit} mtu=${mtu} ecn=${ecn_opt:-none} opts=[${opts}]"
 
 	# --- interval ---
 	# Set the CoDel interval (worst-case RTT to your services). Default 100ms
@@ -207,6 +230,15 @@ add_nssfq_codel() {
 	esac
 
 	# shellcheck disable=2046
+	# Try with ECN parameter first; fall back without if tc rejects it
+	# (stock iproute2 prints "Illegal, ECN not supported" and exits 1).
+	if [ -n "$ecn_opt" ]; then
+		$TC qdisc add dev $iface parent 1: handle 10: nssfq_codel \
+			$(get_limit "$limit") $(get_target "$target" "$speed") \
+			${opts} ${ecn_opt} set_default accel_mode 0 2>/dev/null && return 0
+		sqm_warn "add_nssfq_codel: tc rejected '${ecn_opt}' — install patched iproute2 for ECN control. Retrying without."
+	fi
+
 	$TC qdisc add dev $iface parent 1: handle 10: nssfq_codel \
 		$(get_limit "$limit") $(get_target "$target" "$speed") \
 		${opts} set_default accel_mode 0
@@ -230,7 +262,7 @@ egress() {
 	}
 
 	# shellcheck disable=2153
-	add_nssfq_codel ${IFACE} ${UPLINK} ${ETARGET} ${ELIMIT} ${mtu} "${EQDISC_OPTS}" || {
+	add_nssfq_codel ${IFACE} ${UPLINK} ${ETARGET} ${ELIMIT} ${mtu} "${EQDISC_OPTS}" "${EECN}" || {
 		sqm_error "egress: failed to add nssfq_codel"
 		return 1
 	}
@@ -272,7 +304,7 @@ ingress() {
 	}
 
 	# shellcheck disable=2153
-	add_nssfq_codel ${DEV} ${DOWNLINK} ${ITARGET} ${ILIMIT} ${mtu} "${IQDISC_OPTS}" || {
+	add_nssfq_codel ${DEV} ${DOWNLINK} ${ITARGET} ${ILIMIT} ${mtu} "${IQDISC_OPTS}" "${IECN}" || {
 		sqm_error "ingress: failed to add nssfq_codel"
 		return 1
 	}
